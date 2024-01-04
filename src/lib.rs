@@ -10,12 +10,14 @@ pub use anyhow::Result;
 use convert_case::{Case, Casing};
 #[cfg(target_arch = "wasm32")]
 use gloo_utils::format::JsValueSerdeExt;
-use indexmap::{IndexMap, IndexSet};
+use indexmap::{IndexMap}; //IndexSet
 use openapi::v3_0::{self as openapi3, ObjectOrReference, Parameter, SecurityRequirement};
 use postman::AuthType;
 use std::collections::BTreeMap;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+use regex::Regex;
+use serde_json::Number;
 
 static VAR_REPLACE_CREDITS: usize = 20;
 
@@ -101,8 +103,10 @@ impl std::str::FromStr for TargetFormat {
     }
 }
 
-pub struct Transpiler<'a> {
+pub struct Transpiler<'a> {    
     variable_map: &'a BTreeMap<String, serde_json::value::Value>,
+    info_description: &'a str,
+    cur_op_id: &'a mut Vec<String>,
 }
 
 struct TranspileState<'a> {
@@ -113,29 +117,31 @@ struct TranspileState<'a> {
 }
 
 impl<'a> Transpiler<'a> {
-    pub fn new(variable_map: &'a BTreeMap<String, serde_json::value::Value>) -> Self {
-        Self { variable_map }
+    pub fn new(variable_map: &'a BTreeMap<String, serde_json::value::Value>, info_description: &'a str, cur_op_id: &'a mut Vec<String>) -> Self {
+        Self { variable_map, info_description, cur_op_id }
     }
 
     pub fn transpile(spec: postman::Spec) -> openapi::OpenApi {
         let description = extract_description(&spec.info.description);
+        let desc = Some(remove_headers_block(&remove_descriptions_block(&description.as_deref().unwrap_or_default())));
+
 
         let mut oas = openapi3::Spec {
             openapi: String::from("3.0.3"),
             info: openapi3::Info {
                 license: None,
-                contact: Some(openapi3::Contact::default()),
-                description,
-                terms_of_service: None,
+                // contact: Some(openapi3::Contact::default()),
+                description: desc,
+                terms_of_service: Some(String::from("https://www.openwebninja.com/terms")),
                 version: String::from("1.0.0"),
                 title: spec.info.name,
             },
             components: None,
             external_docs: None,
             paths: IndexMap::new(),
-            security: None,
+            security: Some(Vec::<SecurityRequirement>::new()),
             servers: Some(Vec::<openapi3::Server>::new()),
-            tags: Some(IndexSet::<openapi3::Tag>::new()),
+            // tags: Some(IndexSet::<openapi3::Tag>::new()),
         };
 
         let mut variable_map = BTreeMap::<String, serde_json::value::Value>::new();
@@ -160,8 +166,10 @@ impl<'a> Transpiler<'a> {
             auth_stack: &mut Vec::<SecurityRequirement>::new(),
         };
 
-        let transpiler = Transpiler {
+        let mut transpiler = Transpiler {
             variable_map: &mut variable_map,
+            info_description: &description.unwrap_or_default(),
+            cur_op_id: &mut Vec::<String>::new()
         };
 
         if let Some(auth) = spec.auth {
@@ -182,7 +190,7 @@ impl<'a> Transpiler<'a> {
         openapi::OpenApi::V3_0(Box::new(oas))
     }
 
-    fn transform(&self, state: &mut TranspileState, items: &[postman::Items]) {
+    fn transform(&mut self, state: &mut TranspileState, items: &[postman::Items]) {
         for item in items {
             if let Some(i) = &item.item {
                 let name = match &item.name {
@@ -203,35 +211,35 @@ impl<'a> Transpiler<'a> {
     }
 
     fn transform_folder(
-        &self,
+        &mut self,
         state: &mut TranspileState,
         items: &[postman::Items],
-        name: &str,
-        description: Option<String>,
+        _name: &str,
+        _description: Option<String>,
         auth: &Option<postman::Auth>,
     ) {
-        let mut pushed_tag = false;
+        let pushed_tag = false;
         let mut pushed_auth = false;
 
-        if let Some(t) = &mut state.oas.tags {
-            let mut tag = openapi3::Tag {
-                name: name.to_string(),
-                description,
-            };
+        // if let Some(t) = &mut state.oas.tags {
+        //     let mut tag = openapi3::Tag {
+        //         name: name.to_string(),
+        //         description,
+        //     };
 
-            let mut i: usize = 0;
-            while t.contains(&tag) {
-                i += 1;
-                tag.name = format!("{tagName}{i}", tagName = tag.name);
-            }
+        //     let mut i: usize = 0;
+        //     while t.contains(&tag) {
+        //         i += 1;
+        //         tag.name = format!("{tagName}{i}", tagName = tag.name);
+        //     }
 
-            let name = tag.name.clone();
-            t.insert(tag);
+        //     let name = tag.name.clone();
+        //     t.insert(tag);
 
-            state.hierarchy.push(name);
+        //     state.hierarchy.push(name);
 
-            pushed_tag = true;
-        };
+        //     pushed_tag = true;
+        // };
 
         if let Some(auth) = auth {
             let security = self.transform_security(state, auth);
@@ -260,7 +268,7 @@ impl<'a> Transpiler<'a> {
         }
     }
 
-    fn transform_request(&self, state: &mut TranspileState, item: &postman::Items, name: &str) {
+    fn transform_request(&mut self, state: &mut TranspileState, item: &postman::Items, name: &str) {
         if let Some(postman::RequestUnion::RequestClass(request)) = &item.request {
             if let Some(postman::Url::UrlClass(u)) = &request.url {
                 if let Some(postman::Host::StringArray(parts)) = &u.host {
@@ -324,7 +332,7 @@ impl<'a> Transpiler<'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn transform_paths(
-        &self,
+        &mut self,
         state: &mut TranspileState,
         item: &postman::Items,
         request: &postman::RequestClass,
@@ -400,6 +408,7 @@ impl<'a> Transpiler<'a> {
         }
 
         path.parameters = self.generate_path_parameters(&resolved_segments, &url.variable);
+        self.cur_op_id.clear();        
 
         if !is_merge {
             let mut op_id = request_name
@@ -422,7 +431,8 @@ impl<'a> Transpiler<'a> {
                 }
             }
 
-            op.operation_id = Some(op_id);
+            op.operation_id = Some(op_id.clone());
+            self.cur_op_id.push(op_id.to_string());
         }
 
         if let Some(qp) = &url.query {
@@ -459,6 +469,7 @@ impl<'a> Transpiler<'a> {
         let mut content_type: Option<String> = None;
 
         if let Some(postman::HeaderUnion::HeaderArray(headers)) = &request.header {
+            let vec_of_headers = find_headers(self.info_description);
             for header in headers.iter() {
                 let key = header.key.to_lowercase();
                 if key == "accept" || key == "authorization" {
@@ -468,13 +479,21 @@ impl<'a> Transpiler<'a> {
                     let content_type_parts: Vec<&str> = header.value.split(';').collect();
                     content_type = Some(content_type_parts[0].to_owned());
                 } else {
+                    
+                    if !vec_of_headers.is_empty() && !vec_of_headers.contains(&header.key) {                        
+                        continue;
+                    }
+        
+                    let infertype = infer_type(&header.value);                    
+                            
                     let param = Parameter {
                         location: "header".to_owned(),
                         name: header.key.to_owned(),
                         description: extract_description(&header.description),
                         schema: Some(openapi3::Schema {
-                            schema_type: Some("string".to_owned()),
-                            example: Some(serde_json::Value::String(header.value.to_owned())),
+                            schema_type: Some(infertype.to_owned()),
+                            example: Transpiler::<'a>::filter_req_header_example(&header.key, &header.value),
+                            description: find_description_by_key(self.info_description, self.cur_op_id.get(0).unwrap(), &header.key),
                             ..openapi3::Schema::default()
                         }),
                         ..Parameter::default()
@@ -556,15 +575,25 @@ impl<'a> Transpiler<'a> {
                 if let Some(postman::Headers::UnionArray(headers)) = &r.header {
                     let mut oas_headers =
                         BTreeMap::<String, openapi3::ObjectOrReference<openapi3::Header>>::new();
+                    let vec_of_headers = find_headers(self.info_description);
                     for h in headers {
                         if let postman::HeaderElement::Header(hdr) = h {
                             if hdr.value.is_empty() || hdr.key.to_lowercase() == "content-type" {
                                 continue;
+                            }                            
+                            if !vec_of_headers.is_empty() && !vec_of_headers.contains(&hdr.key) {
+                                continue;
                             }
+
                             let mut oas_header = openapi3::Header::default();
+
+                            let infertype = infer_type(&hdr.value);
+
                             let header_schema = openapi3::Schema {
-                                schema_type: Some("string".to_string()),
-                                example: Some(serde_json::Value::String(hdr.value.to_string())),
+                                schema_type: Some(infertype.to_owned()),
+                                example: Transpiler::<'a>::filter_req_header_example(&hdr.key, &hdr.value),
+                                description: find_description_by_key(self.info_description, self.cur_op_id.get(0).unwrap(), &hdr.key),
+                                // example: Some(serde_json::Value::String(hdr.value.to_string())),
                                 ..Default::default()
                             };
                             oas_header.schema = Some(header_schema);
@@ -589,7 +618,7 @@ impl<'a> Transpiler<'a> {
                         Ok(v) => match v {
                             serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
                                 response_content_type = Some("application/json".to_string());
-                                if let Some(schema) = Self::generate_schema(&v) {
+                                if let Some(schema) = self.generate_schema(&v, "") {
                                     response_content.schema =
                                         Some(openapi3::ObjectOrReference::Object(schema));
                                 }
@@ -636,17 +665,20 @@ impl<'a> Transpiler<'a> {
                 oas_response.content = Some(response_media_types);
 
                 if let Some(code) = &r.code {
-                    if let Some(existing_response) = op.responses.get_mut(&code.to_string()) {
+                    if let Some(existing_response) = op.responses.get_mut(&code.to_string()) {                    
                         let new_response = oas_response.clone();
-                        if let Some(name) = &new_response.description {
-                            existing_response.description = Some(
-                                existing_response
-                                    .description
-                                    .clone()
-                                    .unwrap_or("".to_string())
-                                    + " / "
-                                    + name,
-                            );
+                        existing_response.description = r.status.clone();
+                        if let Some(name) = &r.status {
+                            let existing_desc = existing_response.description.clone().unwrap_or("".to_string());
+                            if name != &existing_desc {
+                                        existing_response.description = Some(
+                                            existing_desc
+                                                + " / "
+                                                + name,
+                                        );                                    
+                            } else {
+                                existing_response.description = Some(name.clone());
+                            }
                         }
 
                         if let Some(headers) = new_response.headers {
@@ -686,7 +718,7 @@ impl<'a> Transpiler<'a> {
                                         }
                                         _ => BTreeMap::<String, _>::new(),
                                     };
-                                    for (key, value) in new_example_map.iter() {
+                                    for (key, value) in new_example_map.iter() {                                        
                                         existing_examples.insert(key.clone(), value.clone());
                                     }
                                 }
@@ -786,7 +818,7 @@ impl<'a> Transpiler<'a> {
                 Some(Some((name, vec![])))
             }
             AuthType::Apikey => {
-                let name = "apiKey".to_string();
+                let name = "RapidAPIKey".to_string();
                 if let Some(apikey) = &auth.apikey {
                     let scheme = openapi3::SecurityScheme::ApiKey {
                         name: self.resolve_variables(
@@ -884,6 +916,15 @@ impl<'a> Transpiler<'a> {
         security
     }
 
+    fn filter_req_header_example(name: &str, value: &str) -> Option<serde_json::Value> {        
+        if name != "X-RapidAPI-Key" {
+            // Extract the captured value from the regex captures and convert to String            
+            Some(value_infer_type(value))
+        } else {
+            Some(serde_json::Value::String("123456".to_string()))
+        }
+    }
+
     fn extract_request_body(
         &self,
         body: &postman::Body,
@@ -925,7 +966,7 @@ impl<'a> Transpiler<'a> {
                                         request_body.content.get_mut(ct).unwrap()
                                     };
 
-                                    if let Some(schema) = Self::generate_schema(&v) {
+                                    if let Some(schema) = self.generate_schema(&v, "") {
                                         content.schema =
                                             Some(openapi3::ObjectOrReference::Object(schema));
                                     }
@@ -1007,7 +1048,7 @@ impl<'a> Transpiler<'a> {
                             }
                         }
                         let oas_obj = serde_json::Value::Object(oas_data);
-                        if let Some(schema) = Self::generate_schema(&oas_obj) {
+                        if let Some(schema) = self.generate_schema(&oas_obj, "") {
                             content.schema = Some(openapi3::ObjectOrReference::Object(schema));
                         }
 
@@ -1055,19 +1096,23 @@ impl<'a> Transpiler<'a> {
                             if let Some(t) = &i.form_parameter_type {
                                 let is_binary = t.as_str() == "file";
                                 if let Some(v) = &i.value {
+                                    let infertype = infer_type(&v);
                                     let value = serde_json::Value::String(v.to_string());
-                                    let prop_schema = Self::generate_schema(&value);
+                                    let prop_schema = self.generate_schema(&value, "");
                                     if let Some(mut prop_schema) = prop_schema {
                                         if is_binary {
                                             prop_schema.format = Some("binary".to_string());
                                         }
+                                        prop_schema.schema_type = Some(infertype.to_owned());
                                         prop_schema.description =
                                             extract_description(&i.description);
                                         properties.insert(i.key.clone(), prop_schema);
                                     }
-                                } else {
+                                } else {                                    
+                                    let infertype = infer_type(&i.value.as_deref().unwrap_or_default());                    
+
                                     let mut prop_schema = openapi3::Schema {
-                                        schema_type: Some("string".to_string()),
+                                        schema_type: Some(infertype.to_owned()),
                                         description: extract_description(&i.description),
                                         ..Default::default()
                                     };
@@ -1186,7 +1231,7 @@ impl<'a> Transpiler<'a> {
         replace_fn(s)
     }
 
-    fn generate_schema(value: &serde_json::Value) -> Option<openapi3::Schema> {
+    fn generate_schema(&self, value: &serde_json::Value, key: &str) -> Option<openapi3::Schema> {
         match value {
             serde_json::Value::Object(m) => {
                 let mut schema = openapi3::Schema {
@@ -1195,19 +1240,30 @@ impl<'a> Transpiler<'a> {
                 };
 
                 let mut properties = BTreeMap::<String, openapi3::Schema>::new();
+                let mut required: Vec<String> = Vec::new();
 
                 for (key, val) in m.iter() {
-                    if let Some(v) = Self::generate_schema(val) {
+                    if let Some(v) = self.generate_schema(val, &key.to_string()) {
                         properties.insert(key.to_string(), v);
+
+                        let desc = find_description_by_key(self.info_description, self.cur_op_id.get(0).unwrap(), key);
+                        if is_required(desc.as_deref().unwrap_or_default()) {
+                            required.push(key.to_string());
+                        }
                     }
                 }
 
                 schema.properties = Some(properties);
+                if !required.is_empty() {
+                    schema.required = Some(required);
+                }                
                 Some(schema)
             }
             serde_json::Value::Array(a) => {
+                let desc = find_description_by_key(self.info_description, self.cur_op_id.get(0).unwrap(), key);
                 let mut schema = openapi3::Schema {
                     schema_type: Some("array".to_string()),
+                    description: replace_description(&desc),
                     ..Default::default()
                 };
 
@@ -1215,7 +1271,7 @@ impl<'a> Transpiler<'a> {
 
                 for n in 0..a.len() {
                     if let Some(i) = a.get(n) {
-                        if let Some(i) = Self::generate_schema(i) {
+                        if let Some(i) = self.generate_schema(i, "") {
                             if n == 0 {
                                 item_schema = i;
                             } else {
@@ -1226,38 +1282,54 @@ impl<'a> Transpiler<'a> {
                 }
 
                 schema.items = Some(Box::new(item_schema));
-                schema.example = Some(value.clone());
+                schema.example = None;// Some(value.clone());
 
                 Some(schema)
             }
             serde_json::Value::String(_) => {
+                let desc = find_description_by_key(self.info_description, self.cur_op_id.get(0).unwrap(), key);                
                 let schema = openapi3::Schema {
                     schema_type: Some("string".to_string()),
-                    example: Some(value.clone()),
+                    default: get_def_value(desc.as_deref().unwrap_or_default()),
+                    example: None,//Some(value.clone()),
+                    enum_values: find_enum_by_key(self.info_description, self.cur_op_id.get(0).unwrap(), key),
+                    nullable: get_nullable_value(desc.as_deref().unwrap_or_default()),
+                    description: replace_description(&desc),
                     ..Default::default()
-                };
+                };                
                 Some(schema)
             }
             serde_json::Value::Number(_) => {
+                let desc = find_description_by_key(self.info_description, self.cur_op_id.get(0).unwrap(), key);
+                let v_string = &value.to_string();
+                let infertype = infer_type(v_string);
                 let schema = openapi3::Schema {
-                    schema_type: Some("number".to_string()),
-                    example: Some(value.clone()),
+                    schema_type: Some(infertype.to_owned()),
+                    description: replace_description(&desc),
+                    default: get_def_value(desc.as_deref().unwrap_or_default()),
+                    minimum: get_min_value(desc.as_deref().unwrap_or_default()),
+                    maximum: get_max_value(desc.as_deref().unwrap_or_default()),
+                    nullable: get_nullable_value(desc.as_deref().unwrap_or_default()),
+                    example: None,//Some(value.clone()),
                     ..Default::default()
-                };
+                };            
                 Some(schema)
-            }
+            }        
             serde_json::Value::Bool(_) => {
+                let desc = find_description_by_key(self.info_description, self.cur_op_id.get(0).unwrap(), key);
                 let schema = openapi3::Schema {
                     schema_type: Some("boolean".to_string()),
-                    example: Some(value.clone()),
+                    default: get_def_value(desc.as_deref().unwrap_or_default()),
+                    example: None,//Some(value.clone()),
+                    description: replace_description(&desc),                    
                     ..Default::default()
-                };
+                };                
                 Some(schema)
             }
             serde_json::Value::Null => {
                 let schema = openapi3::Schema {
                     nullable: Some(true),
-                    example: Some(value.clone()),
+                    example: None,//Some(value.clone()),
                     ..Default::default()
                 };
                 Some(schema)
@@ -1383,6 +1455,7 @@ impl<'a> Transpiler<'a> {
         }
     }
 
+    
     fn generate_query_parameters(
         &self,
         query_params: &[postman::QueryParam],
@@ -1395,23 +1468,30 @@ impl<'a> Transpiler<'a> {
                     if keys.contains(&key.as_str()) {
                         return None;
                     }
+                
+                    let desc = find_description_by_key(self.info_description, self.cur_op_id.get(0).unwrap(), &key);  //extract_description(&qp.description);
+                    let infertype = infer_type(qp.value.as_deref().unwrap_or_default());
 
                     keys.push(key);
-                    let param = Parameter {
+                    let mut param = Parameter {
                         name: key.to_owned(),
-                        description: extract_description(&qp.description),
+                        description: replace_description(&desc),
                         location: "query".to_owned(),
                         schema: Some(openapi3::Schema {
-                            schema_type: Some("string".to_string()),
+                            schema_type: Some(infertype.to_owned()),
+                            default: get_def_value(desc.as_deref().unwrap_or_default()),                            
+                            minimum: get_min_value(desc.as_deref().unwrap_or_default()),
+                            maximum: get_max_value(desc.as_deref().unwrap_or_default()),                            
                             example: qp.value.as_ref().map(|pval| {
-                                serde_json::Value::String(
-                                    self.resolve_variables(pval, VAR_REPLACE_CREDITS),
-                                )
+                                value_infer_type(&self.resolve_variables(pval, VAR_REPLACE_CREDITS))                                
                             }),
                             ..openapi3::Schema::default()
                         }),
                         ..Parameter::default()
                     };
+                    if is_required(desc.as_deref().unwrap_or_default()) {
+                        param.required = Some(true)
+                    }                    
 
                     Some(openapi3::ObjectOrReference::Object(param))
                 }
@@ -1427,6 +1507,112 @@ impl<'a> Transpiler<'a> {
     }
 }
 
+fn value_infer_type(value: &str) -> serde_json::value::Value {
+    if value.parse::<i64>().is_ok() {
+        serde_json::Value::Number(
+            match value.parse::<i64>().map(Number::from) {
+                Ok(number) => {
+                    number
+                }
+                Err(_) => todo!()
+            }
+        )
+    } else if value.parse::<f64>().is_ok() {
+        serde_json::Value::Number(
+            match value.parse::<f64>().map(Number::from_f64) {
+                Ok(number) => {
+                    number.unwrap()
+                }
+                Err(_) => todo!()
+            }
+        )    
+    } else if value == "true" || value == "false" {
+        serde_json::Value::Bool(value == "true")
+    } else {
+        serde_json::Value::String(value.to_owned())
+    }
+}
+
+fn infer_type(value: &str) -> &str {
+    if value.parse::<i64>().is_ok() {
+        "integer"
+    } else if value.parse::<f64>().is_ok() {
+        "number"
+    } else if value == "true" || value == "false" {
+        "boolean"
+    } else {
+        "string"
+    }
+}
+
+fn is_required(text: &str) -> bool {
+    text.contains("\\[required\\]")
+}
+
+fn get_def_value(text: &str) -> Option<serde_json::Value> {
+    // Create a regex pattern to capture the value inside [default: .*]
+    let pattern = Regex::new(r"\[default: (.+?)\\]").unwrap();
+
+    // Check if the pattern matches the text
+    if let Some(captures) = pattern.captures(text) {
+        // Extract the captured value from the regex captures and convert to String
+        Some(value_infer_type(captures.get(1).map(|m| m.as_str()).unwrap_or_default()))
+    } else {
+        // Pattern not found
+        None
+    }
+}
+
+fn get_min_value(text: &str) -> Option<serde_json::Value> {    
+    let pattern = Regex::new(r"\[min: (.+?)\\]").unwrap();
+
+    // Check if the pattern matches the text
+    if let Some(captures) = pattern.captures(text) {
+        // Extract the captured value from the regex captures and convert to String
+        Some(value_infer_type(captures.get(1).map(|m| m.as_str()).unwrap_or_default()))
+    } else {
+        // Pattern not found
+        None
+    }
+}
+
+fn get_max_value(text: &str) -> Option<serde_json::Value> {    
+    let pattern = Regex::new(r"\[max: (.+?)\\]").unwrap();
+
+    // Check if the pattern matches the text
+    if let Some(captures) = pattern.captures(text) {
+        // Extract the captured value from the regex captures and convert to String
+        Some(value_infer_type(captures.get(1).map(|m| m.as_str()).unwrap_or_default()))
+    } else {
+        // Pattern not found
+        None
+    }
+}
+
+fn get_nullable_value(text: &str) -> Option<bool> {
+    if text.contains("\\[nullable\\]") {
+        Some(true)
+    } else {        
+        None
+    }
+}
+
+fn replace_description(description: &Option<String>) -> Option<String> {
+    if description.as_deref().unwrap_or_default().is_empty() {
+        return None
+    }
+    let pattern = Regex::new(r"\\\[default: .*\]").unwrap();
+    let pattern_max = Regex::new(r"\\\[max: .*\]").unwrap();
+    let pattern_min = Regex::new(r"\\\[min: .*\]").unwrap();
+    // Replace matches with an empty string
+    let modified_description = pattern.replace_all(description.as_deref().unwrap_or_default(), "");
+    let modified_description1 = pattern_max.replace_all(modified_description.as_ref(), "");
+    let modified_description2 = pattern_min.replace_all(modified_description1.as_ref(), "");
+    let modified_description3 = modified_description2.replace("\\[nullable\\]", "");
+
+    Some(modified_description3.replace("\\[required\\]", ""))
+}
+
 fn extract_description(description: &Option<postman::DescriptionUnion>) -> Option<String> {
     match description {
         Some(d) => match d {
@@ -1436,6 +1622,136 @@ fn extract_description(description: &Option<postman::DescriptionUnion>) -> Optio
             }
         },
         None => None,
+    }
+}
+
+fn remove_descriptions_block(input: &str) -> String {
+    let descriptions_start = "\\[descriptions\\]";
+    let descriptions_end = "\\[/descriptions\\]";
+    if input.is_empty() {
+        input.to_string()
+    } else {
+        if let Some(start_idx) = input.find(descriptions_start) {
+            if let Some(end_idx) = input.find(descriptions_end) {
+                let before = &input[..start_idx];
+                let after = &input[end_idx + descriptions_end.len()..];
+                format!("{}{}", before, after).trim().to_string()
+            } else {
+                input.trim().to_string()
+            }
+        } else {
+            input.trim().to_string()
+        }
+    }
+}
+
+fn remove_headers_block(input: &str) -> String {
+    let descriptions_start = "\\[headers\\]";
+    let descriptions_end = "\\[/headers\\]";
+    if input.is_empty() {
+        input.to_string()
+    } else {
+        if let Some(start_idx) = input.find(descriptions_start) {
+            if let Some(end_idx) = input.find(descriptions_end) {
+                let before = &input[..start_idx];
+                let after = &input[end_idx + descriptions_end.len()..];
+                format!("{}{}", before, after).trim().to_string()
+            } else {
+                input.trim().to_string()
+            }
+        } else {
+            input.trim().to_string()
+        }
+    }
+}
+
+fn find_description_by_key(input: &str, section_name: &str, key: &str) -> Option<String> {
+    if key.is_empty() {
+        return None
+    }
+
+    let section_start = format!("\\[{}\\]", section_name);
+    let section_end = format!("\\[/{}\\]", section_name);
+    
+    // Build the regex pattern
+    let pattern_str = format!("^([^a-zA-Z]*{})[ ]+-[ ]+(.*)", key);
+    let pattern = Regex::new(&pattern_str).expect("Invalid regex pattern");
+
+    if let Some(section_idx) = input.find(&section_start) {        
+        if let Some(section_end_idx) = input[section_idx..].find(&section_end) {
+
+            let section_content = &input[section_idx + section_start.len()..section_idx + section_end_idx];            
+
+            // Iterate over lines in the section
+            for line in section_content.lines() {
+                if let Some(captures) = pattern.captures(line) {
+                    if let Some(description) = captures.get(2) {
+                        return Some(description.as_str().trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // If the key is not found in the specified section, try to find it in the "global" section
+    let global_section_start = "\\[global\\]";
+    let global_section_end = "\\[/global\\]";
+
+    if let Some(global_idx) = input.find(global_section_start) {
+        if let Some(global_end_idx) = input[global_idx..].find(global_section_end) {
+            let global_content = &input[global_idx + global_section_start.len()..global_idx + global_end_idx];
+
+// println!("string global: {} with content: {}", key, pattern_str);
+
+            // Iterate over lines in the global section
+            for line in global_content.lines() {                
+                if let Some(captures) = pattern.captures(line) {                                        
+                    if let Some(description) = captures.get(2) {
+                        return Some(description.as_str().trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn find_headers(input: &str) -> Vec<String> {
+    let section_start = format!("\\[{}\\]", "headers");
+    let section_end = format!("\\[/{}\\]", "headers");
+        
+    let mut my_vec: Vec<String> = Vec::new();
+
+    if let Some(section_idx) = input.find(&section_start) {        
+        if let Some(section_end_idx) = input[section_idx..].find(&section_end) {
+
+            let section_content = &input[section_idx + section_start.len()..section_idx + section_end_idx];            
+
+            // Iterate over lines in the section
+            for line in section_content.lines() {                 
+                let names: Vec<String> = line.split(',').map(|s| s.trim().to_string()).collect();
+                if !names.is_empty() {                    
+                    my_vec.extend(names);
+                }
+            }
+        }
+    }
+
+    return my_vec;
+}
+
+fn find_enum_by_key(_input: &str, _section_name: &str, key: &str) -> Option<Vec<String>> {
+    // find status string    
+    if key == "status" {
+        let mut my_vec: Vec<String> = Vec::new();
+        my_vec.push("OK".to_string());
+        my_vec.push("ERROR".to_string());
+
+        return Some(my_vec);
+    } else {
+        // Pattern not found
+        None
     }
 }
 

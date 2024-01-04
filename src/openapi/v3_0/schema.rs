@@ -1,6 +1,6 @@
 //! Schema specification for [OpenAPI 3.0.0](https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.0.md)
 
-use indexmap::{IndexMap, IndexSet};
+use indexmap::{IndexMap}; //IndexSet
 use std::{
     collections::{BTreeMap, HashMap},
     hash::{Hash, Hasher},
@@ -75,8 +75,8 @@ pub struct Spec {
     /// [Operation Object](https://github.com/OAI/OpenAPI-Specification/blob/master/versions/3.0.1.md#operationObject)
     /// must be declared. The tags that are not declared MAY be organized randomly or
     /// based on the tools' logic. Each tag name in the list MUST be unique.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<IndexSet<Tag>>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // pub tags: Option<IndexSet<Tag>>,
 
     /// Additional external documentation.
     #[serde(skip_serializing_if = "Option::is_none", rename = "externalDocs")]
@@ -104,8 +104,8 @@ pub struct Info {
     /// or the API implementation version).
     pub version: String,
     /// The contact information for the exposed API.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contact: Option<Contact>,
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    // pub contact: Option<Contact>,
     /// The license information for the exposed API.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub license: Option<License>,
@@ -517,6 +517,9 @@ pub struct Schema {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minimum: Option<serde_json::Value>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<serde_json::Value>,
 
     /// Inline or referenced schema MUST be of a [Schema Object](#schemaObject) and not a standard
     /// JSON Schema.
